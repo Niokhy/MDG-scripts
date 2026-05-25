@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DSLib — Shared utilities for Demonicscans automators
 // @namespace    demonicscans-lib
-// @version      1.0
+// @version      1.1
 // @description  Shared constants, utilities, CSS and API helpers for DS automator scripts
 // @author       Niokhy
 // ==/UserScript==
@@ -305,6 +305,121 @@ const DSLib = (() => {
             logFn('⚠️ Failed to auto-fetch inventory IDs.');
         }
     }
+
+    /**
+     * Convertit une valeur en entier ≥ 0 (ou null si non fini).
+     * Remplace les fonctions toNonNegativeInt locales dans Dungeon et Wave.
+     *
+     * @param  {*}       v  — valeur à convertir
+     * @returns {number|null}
+     */
+    toNonNeg(v) {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return null;
+        return Math.max(0, Math.floor(n));
+    },
+ 
+    /**
+     * Rend un élément GUI draggable via son header (#gui-top ou #mini-header).
+     * Restaure la position sauvegardée au chargement, et persiste à chaque mouseup.
+     *
+     * @param {HTMLElement} gui            — conteneur principal du GUI
+     * @param {Function}    getPosition    — () => { left, top } | null
+     * @param {Function}    onPositionSaved — ({ left, top }) => void  (appelé après mouseup)
+     */
+    makeDraggable(gui, getPosition, onPositionSaved) {
+        // Restaurer la dernière position connue
+        const pos = getPosition();
+        if (pos && typeof pos.left === 'number' && typeof pos.top === 'number') {
+            const maxX = Math.max(0, window.innerWidth  - 100);
+            const maxY = Math.max(0, window.innerHeight - 50);
+            gui.style.left   = Math.min(pos.left, maxX) + 'px';
+            gui.style.top    = Math.min(pos.top,  maxY) + 'px';
+            gui.style.right  = 'auto';
+            gui.style.bottom = 'auto';
+        }
+ 
+        let offsetX = 0, offsetY = 0, dragging = false;
+ 
+        document.addEventListener('mousedown', (e) => {
+            // Ignorer les clics sur des contrôles interactifs
+            if (e.target.closest('button, input, select, textarea, a, label')) return;
+            const header = gui.querySelector('#gui-top, #mini-header');
+            if (!header || !header.contains(e.target)) return;
+ 
+            const rect = gui.getBoundingClientRect();
+            offsetX  = e.clientX - rect.left;
+            offsetY  = e.clientY - rect.top;
+            dragging = true;
+ 
+            gui.style.left   = rect.left + 'px';
+            gui.style.top    = rect.top  + 'px';
+            gui.style.right  = 'auto';
+            gui.style.bottom = 'auto';
+            document.body.style.cursor = 'grabbing';
+            e.preventDefault();
+        });
+ 
+        document.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            let x = e.clientX - offsetX;
+            let y = e.clientY - offsetY;
+            const maxX = Math.max(0, window.innerWidth  - gui.offsetWidth);
+            const maxY = Math.max(0, window.innerHeight - gui.offsetHeight);
+            gui.style.left = Math.max(0, Math.min(maxX, x)) + 'px';
+            gui.style.top  = Math.max(0, Math.min(maxY, y)) + 'px';
+        });
+ 
+        document.addEventListener('mouseup', () => {
+            if (!dragging) return;
+            dragging = false;
+            document.body.style.cursor = '';
+            const left = parseInt(gui.style.left, 10);
+            const top  = parseInt(gui.style.top,  10);
+            if (Number.isFinite(left) && Number.isFinite(top)) {
+                onPositionSaved({ left, top });
+            }
+        });
+    },
+ 
+    /**
+     * Crée un canal de log attaché à un élément DOM.
+     * Retourne un objet { add, clear, render, getHistory, setHistory }.
+     *
+     * @param {HTMLElement} element     — div de log à peupler
+     * @param {number}      maxHistory  — taille max du buffer (défaut 80)
+     * @returns {{ add, clear, render, getHistory, setHistory }}
+     */
+    createLogChannel(element, maxHistory = 80) {
+        let _history = [];
+ 
+        const render = () => {
+            if (!element) return;
+            element.innerHTML = '';
+            _history.forEach(txt => {
+                const div = document.createElement('div');
+                div.innerHTML = txt;
+                div.style.borderBottom = '1px solid #333';
+                div.style.padding      = '2px 0';
+                element.appendChild(div);
+            });
+            element.scrollTop = element.scrollHeight;
+        };
+ 
+        return {
+            add(msg) {
+                const fullMsg = `[${DSLib.now()}] ${msg}`;
+                console.log(fullMsg);
+                _history.push(fullMsg);
+                if (_history.length > maxHistory) _history.shift();
+                render();
+            },
+            clear()              { _history = []; render(); },
+            render,
+            getHistory()         { return _history; },
+            setHistory(arr)      { _history = arr; render(); }
+        };
+    },
 
     /* ====================================================================
        POTION USAGE
