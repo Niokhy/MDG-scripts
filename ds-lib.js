@@ -23,7 +23,7 @@ const DSLib = (() => {
        Scripts that declare a different REQUIRED_DSLIB_VERSION will
        refuse to start, forcing the user to update all scripts together.
     ==================================================================== */
-    const VERSION = '1.1';
+    const VERSION = '1.2';
     /* ====================================================================
        CONSTANTS
     ==================================================================== */
@@ -223,6 +223,59 @@ const DSLib = (() => {
             getHistory()    { return _history; },
             setHistory(arr) { _history = arr; render(); }
         };
+    }
+    /* ====================================================================
+       v1.2 — FONCTIONS MUTUALISÉES depuis Reminders
+    ==================================================================== */
+    /**
+     * Formate un grand nombre avec suffixe K / M / B / T.
+     * Ex : 1500000 → "1.50M",  950 → "950"
+     *
+     * @param  {*} value
+     * @returns {string}
+     */
+    function formatBigNumber(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n)) return '0';
+        const abs = Math.abs(n);
+        if (abs >= 1e12) return (n / 1e12).toFixed(2) + 'T';
+        if (abs >= 1e9)  return (n / 1e9).toFixed(2)  + 'B';
+        if (abs >= 1e6)  return (n / 1e6).toFixed(2)  + 'M';
+        if (abs >= 1e3)  return (n / 1e3).toFixed(2)  + 'K';
+        return String(Math.round(n));
+    }
+    /**
+     * Échappe les caractères HTML spéciaux d'une chaîne.
+     * Utile pour insérer du texte utilisateur dans du innerHTML.
+     *
+     * @param  {*} text
+     * @returns {string}
+     */
+    function escapeHtml(text) {
+        return String(text).replace(/[&<>"']/g, (c) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    }
+    /** Alias de escapeHtml — pour les valeurs d'attributs HTML. */
+    function escapeAttr(text) { return escapeHtml(text); }
+    /**
+     * Détecte si un document est une page de challenge Cloudflare
+     * (anti-bot "Just a moment…" / "Attention Required").
+     *
+     * @param  {Document|null} doc
+     * @returns {boolean}
+     */
+    function isChallengeDocument(doc) {
+        if (!doc) return false;
+        const title    = (doc.title                          || '').toLowerCase();
+        const bodyText = (doc.body?.textContent              || '').toLowerCase();
+        const html     = (doc.documentElement?.innerHTML     || '').toLowerCase();
+        if (title.includes('just a moment') || title.includes('attention required')) return true;
+        if (bodyText.includes('checking your browser before accessing'))             return true;
+        if (bodyText.includes('verify you are human'))                               return true;
+        if (html.includes('/cdn-cgi/challenge-platform/'))                           return true;
+        if (doc.querySelector('form#challenge-form, #cf-challenge-running, .cf-browser-verification')) return true;
+        return false;
     }
     /* ====================================================================
        CSS INJECTION
@@ -491,60 +544,4 @@ const DSLib = (() => {
     ==================================================================== */
     function processLootItems(items, lootTracker) {
         if (!items || !Array.isArray(items)) return;
-        items.forEach(item => {
-            const id = item.ITEM_ID || item.id;
-            if (!id) return;
-            if (!lootTracker[id]) {
-                lootTracker[id] = {
-                    count: 0,
-                    name:  item.NAME      || item.name  || 'Unknown Item',
-                    img:   item.IMAGE_URL || item.image || '',
-                    tier:  item.TIER      || item.tier  || 'COMMON'
-                };
-            }
-            lootTracker[id].count++;
-        });
-    }
-    function buildLootGridHTML(lootTracker, baseUrl = BASE_URL) {
-        const itemIds = Object.keys(lootTracker);
-        if (itemIds.length === 0) {
-            return '<div class="ds-empty-loot">No items looted this session yet.</div>';
-        }
-        return itemIds.map(id => {
-            const item = lootTracker[id];
-            const tier = (item.tier || 'COMMON').toUpperCase();
-            const ts   = TIER_STYLES[tier] || TIER_STYLES.COMMON;
-            const cleanPath = item.img.startsWith('/') ? item.img.substring(1) : item.img;
-            const imgUrl    = cleanPath.startsWith('http') ? cleanPath : `${baseUrl}/${cleanPath}`;
-            return `<div class="ds-item-card" title="${item.name} (${item.tier})" style="border-color:${ts.border}; box-shadow:${ts.glow};">
-                        <img src="${imgUrl}" class="ds-item-img" alt="${item.name}">
-                        <div class="ds-item-count">x${item.count}</div>
-                    </div>`;
-        }).join('');
-    }
-    /* ====================================================================
-       PUBLIC API
-    ==================================================================== */
-    return {
-        // Version
-        VERSION,
-        // Constants
-        SKILLS, STATUS_COLORS, TIER_STYLES, POTION_NAMES,
-        BASE_URL, USE_ITEM_URL, HP_POT_URL, INVENTORY_URL, PLAYER_STATS_URL, FORM_HEADERS,
-        // Utilities
-        getCookie, setCookie, now, sleep, rand,
-        buildFormBody, postForm, parseDamageCap,
-        // v1.1 — nouvelles fonctions mutualisées
-        toNonNeg, makeDraggable, createLogChannel,
-        // CSS
-        injectBaseCSS,
-        // Player stats
-        extractPlayerStatsFromDoc, getPlayerStatsFromWave,
-        // Inventory
-        fetchInventoryIds,
-        // Potions
-        useStaminaPotion, refillHp, handleStaminaLogic,
-        // Loot
-        processLootItems, buildLootGridHTML
-    };
-})();
+        items.forEa
