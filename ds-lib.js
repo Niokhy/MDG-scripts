@@ -544,4 +544,62 @@ const DSLib = (() => {
     ==================================================================== */
     function processLootItems(items, lootTracker) {
         if (!items || !Array.isArray(items)) return;
-        items.forEa
+        items.forEach(item => {
+            const id = item.ITEM_ID || item.id;
+            if (!id) return;
+            if (!lootTracker[id]) {
+                lootTracker[id] = {
+                    count: 0,
+                    name:  item.NAME      || item.name  || 'Unknown Item',
+                    img:   item.IMAGE_URL || item.image || '',
+                    tier:  item.TIER      || item.tier  || 'COMMON'
+                };
+            }
+            lootTracker[id].count++;
+        });
+    }
+    function buildLootGridHTML(lootTracker, baseUrl = BASE_URL) {
+        const itemIds = Object.keys(lootTracker);
+        if (itemIds.length === 0) {
+            return '<div class="ds-empty-loot">No items looted this session yet.</div>';
+        }
+        return itemIds.map(id => {
+            const item = lootTracker[id];
+            const tier = (item.tier || 'COMMON').toUpperCase();
+            const ts   = TIER_STYLES[tier] || TIER_STYLES.COMMON;
+            const cleanPath = item.img.startsWith('/') ? item.img.substring(1) : item.img;
+            const imgUrl    = cleanPath.startsWith('http') ? cleanPath : `${baseUrl}/${cleanPath}`;
+            return `<div class="ds-item-card" title="${item.name} (${item.tier})" style="border-color:${ts.border}; box-shadow:${ts.glow};">
+                        <img src="${imgUrl}" class="ds-item-img" alt="${item.name}">
+                        <div class="ds-item-count">x${item.count}</div>
+                    </div>`;
+        }).join('');
+    }
+    /* ====================================================================
+       PUBLIC API
+    ==================================================================== */
+    return {
+        // Version
+        VERSION,
+        // Constants
+        SKILLS, STATUS_COLORS, TIER_STYLES, POTION_NAMES,
+        BASE_URL, USE_ITEM_URL, HP_POT_URL, INVENTORY_URL, PLAYER_STATS_URL, FORM_HEADERS,
+        // Utilities
+        getCookie, setCookie, now, sleep, rand,
+        buildFormBody, postForm, parseDamageCap,
+        // v1.1 — nouvelles fonctions mutualisées
+        toNonNeg, makeDraggable, createLogChannel,
+        // v1.2 — utilitaires depuis Reminders
+        formatBigNumber, escapeHtml, escapeAttr, isChallengeDocument,
+        // CSS
+        injectBaseCSS,
+        // Player stats
+        extractPlayerStatsFromDoc, getPlayerStatsFromWave,
+        // Inventory
+        fetchInventoryIds,
+        // Potions
+        useStaminaPotion, refillHp, handleStaminaLogic,
+        // Loot
+        processLootItems, buildLootGridHTML
+    };
+})();
