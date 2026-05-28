@@ -508,17 +508,23 @@ const DSLib = (() => {
                 logFn(`⏭️ SSP gap-fill skipped: stamina ${currentStamina} ≤ min ${sspMinThreshold}. Trying LSP/FSP.`);
             }
         }
+        // Track whether a LSP or FSP was used — SSP has its own counter (sspRefillsUsed)
+        // and must NOT increment staminaRefillsUsed (which is the LSP/FSP-only counter).
+        let lspFspUsed = false;
         if (!success && useLargeStamina && !largePotionsDepleted) {
             logFn('🧪 Consuming Large Stamina Potion…');
             success = await useStaminaPotion(largeStaminaPotionId, 'Large Stamina Potion', opts);
             if (!success) {
                 logFn('⚠️ Out of Large Stamina Potions. Marking as depleted.');
                 largePotionsDepleted = true;
+            } else {
+                lspFspUsed = true;
             }
         }
         if (!success && useFullStamina) {
             logFn('🧪 Consuming Full Stamina Potion…');
             success = await useStaminaPotion(fullStaminaPotionId, 'Full Stamina Potion', opts);
+            if (success) lspFspUsed = true;
         }
         if (!success && enableSsp && sspRefillsUsed < maxSspRefills && smallStaminaPotionId) {
             logFn('🧪 Consuming Small Stamina Potion…');
@@ -531,9 +537,11 @@ const DSLib = (() => {
             }
         }
         if (success) {
-            staminaRefillsUsed++;
-            persistStatsFn();
-            logFn(`⚡ Stamina Refilled. Total LSP/FSP used: ${staminaRefillsUsed}/${maxStaminaRefills}`);
+            if (lspFspUsed) {
+                staminaRefillsUsed++;
+                persistStatsFn();
+                logFn(`⚡ Stamina Refilled. Total LSP/FSP used: ${staminaRefillsUsed}/${maxStaminaRefills}`);
+            }
         } else {
             logFn('⚠️ No usable Stamina Potions found.');
         }
@@ -545,61 +553,62 @@ const DSLib = (() => {
     function processLootItems(items, lootTracker) {
         if (!items || !Array.isArray(items)) return;
         items.forEach(item => {
-            const id = item.ITEM_ID || item.id;
-            if (!id) return;
-            if (!lootTracker[id]) {
-                lootTracker[id] = {
-                    count: 0,
-                    name:  item.NAME      || item.name  || 'Unknown Item',
-                    img:   item.IMAGE_URL || item.image || '',
-                    tier:  item.TIER      || item.tier  || 'COMMON'
-                };
-            }
-            lootTracker[id].count++;
-        });
-    }
-    function buildLootGridHTML(lootTracker, baseUrl = BASE_URL) {
-        const itemIds = Object.keys(lootTracker);
-        if (itemIds.length === 0) {
-            return '<div class="ds-empty-loot">No items looted this session yet.</div>';
+        if (!item) return;
+        const id = item.id || item.inv_id || item.item_id;
+        if (!id) return;
+        if (!lootTracker[id]) {
+            lootTracker[id] = {
+                count: 0,
+                img:   item.img   || item.image || '',
+                name:  item.name  || '',
+                tier:  (item.tier || 'COMMON').toUpperCase()
+            };
         }
-        return itemIds.map(id => {
-            const item = lootTracker[id];
-            const tier = (item.tier || 'COMMON').toUpperCase();
-            const ts   = TIER_STYLES[tier] || TIER_STYLES.COMMON;
-            const cleanPath = item.img.startsWith('/') ? item.img.substring(1) : item.img;
-            const imgUrl    = cleanPath.startsWith('http') ? cleanPath : `${baseUrl}/${cleanPath}`;
-            return `<div class="ds-item-card" title="${item.name} (${item.tier})" style="border-color:${ts.border}; box-shadow:${ts.glow};">
-                        <img src="${imgUrl}" class="ds-item-img" alt="${item.name}">
-                        <div class="ds-item-count">x${item.count}</div>
-                    </div>`;
+        lootTracker[id].count += (item.quantity || item.count || 1);
+    });
+}
+    /* ====================================================================
+       LOOT GRID HTML BUILDER
+    ==================================================================== */
+    /**
+     * Builds an HTML string of item cards from a lootTracker object.
+     * Intended to be injected into a .ds-loot-grid container.
+     *
+     * @param  {Object} lootTracker  — { [id]: { count, img, name, tier } }
+     * @param  {string} baseUrl      — base URL for relative image paths
+     * @returns {string}
+     */
+    function buildLootGridHTML(lootTracker, baseUrl) {
+        const items = Object.entries(lootTracker);
+        if (items.length === 0) return '<div class="ds-empty-loot">No items looted this session yet.</div>';
+        return items.map(([id, data]) => {
+            const tier   = (data.tier || 'COMMON').toUpperCase();
+            const style  = TIER_STYLES[tier] || TIER_STYLES.COMMON;
+            const imgSrc = data.img
+                ? (data.img.startsWith('http') ? data.img : `${baseUrl}/${data.img.replace(/^\//, '')}`)
+                : '';
+            const tooltip = `${data.name || id} ×${data.count}${tier !== 'COMMON' ? ' [' + tier + ']' : ''}`;
+            return `<div class="ds-item-card" style="border-color:${style.border}; box-shadow:${style.glow};" title="${escapeAttr(tooltip)}">
+            ${imgSrc ? `<img class="ds-item-img" src="${escapeAttr(imgSrc)}" alt="${escapeAttr(data.name || '')}">` : ''}
+            <span class="ds-item-count">×${data.count}</span>
+        </div>`;
         }).join('');
     }
-    /* ====================================================================
-       PUBLIC API
-    ==================================================================== */
+    /* ==================================================================== */
     return {
-        // Version
         VERSION,
-        // Constants
-        SKILLS, STATUS_COLORS, TIER_STYLES, POTION_NAMES,
-        BASE_URL, USE_ITEM_URL, HP_POT_URL, INVENTORY_URL, PLAYER_STATS_URL, FORM_HEADERS,
-        // Utilities
+        SKILLS, STATUS_COLORS, TIER_STYLES,
+        BASE_URL,
         getCookie, setCookie, now, sleep, rand,
-        buildFormBody, postForm, parseDamageCap,
-        // v1.1 — nouvelles fonctions mutualisées
-        toNonNeg, makeDraggable, createLogChannel,
-        // v1.2 — utilitaires depuis Reminders
-        formatBigNumber, escapeHtml, escapeAttr, isChallengeDocument,
-        // CSS
+        buildFormBody, postForm,
+        parseDamageCap, toNonNeg,
+        makeDraggable, createLogChannel,
         injectBaseCSS,
-        // Player stats
+        formatBigNumber, escapeHtml, escapeAttr, isChallengeDocument,
         extractPlayerStatsFromDoc, getPlayerStatsFromWave,
-        // Inventory
         fetchInventoryIds,
-        // Potions
-        useStaminaPotion, refillHp, handleStaminaLogic,
-        // Loot
-        processLootItems, buildLootGridHTML
+        refillHp, handleStaminaLogic,
+        processLootItems,
+        buildLootGridHTML
     };
 })();
