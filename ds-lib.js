@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DSLib — Shared utilities for Demonicscans automators
 // @namespace    demonicscans-lib
-// @version      1.3
+// @version      1.5
 // @description  Shared constants, utilities, CSS and API helpers for DS automator scripts
 // @author       Niokhy
 // ==/UserScript==
@@ -10,7 +10,7 @@
  *
  * Usage in another script's header:
  *   // @require  file:///C:/path/to/ds-lib.js
- *   // @require  https://cdn.jsdelivr.net/gh/your-user/your-repo@1.3/ds-lib.js
+ *   // @require  https://cdn.jsdelivr.net/gh/your-user/your-repo@1.5/ds-lib.js
  *
  * Then in the script body:
  *   const { SKILLS, getCookie, handleStaminaLogic, ... } = DSLib;
@@ -31,6 +31,28 @@
  *       • wireTabs                — bind générique des `.ds-tab-btn[data-target]`
  *       • runSkillPlan            — exécute un plan d'attaque skill-par-skill
  *       • iframe.{create,waitForLoad,waitFor,simulateDrag}
+ *
+ * v1.4 (mineure) — Class & Mana system :
+ *   - Constants  : MAX_MANA, CLASS_SKILLS, JUDGMENT_BOOSTABLE_SKILLS,
+ *                  CLASSES_URL, BATTLE_URL, DAMAGE_URL.
+ *   - Pure fns   : extractManaFromDoc, fetchPlayerClass, fetchManaFromBattle,
+ *                  castClassSkill.
+ *   - Decision   : getActiveJudgmentSeal(sharedSettings),
+ *                  shouldCastJudgmentSeal(skillName, isBoss, sharedSettings).
+ *   - Stateful   : createManaManager({ ... }) — encapsule mana state + refill flow.
+ *
+ * v1.5 (mineure) — Kill switch (3 niveaux) :
+ *   - Niveau 1 = REQUIRED_DSLIB_VERSION (mécanisme existant).
+ *   - Niveau 2 = suppression du tag GitHub (procédure manuelle).
+ *   - Niveau 3 = manifest.json distant fetché au démarrage. Si la version
+ *                est dans killedVersions OU < minSupported → DSLib.ready
+ *                resolve avec { ok: false, reason } et les scripts qui
+ *                awaitent ready peuvent refuser de démarrer.
+ *   - Exports  : DSLib.ready (Promise<{ok, reason?, manifest?}>),
+ *                DSLib.compareVersions(a, b).
+ *   - Usage côté script :
+ *        const r = await DSLib.ready;
+ *        if (!r.ok) { console.error(r.reason); return; }
  */
 const DSLib = (() => {
     'use strict';
@@ -40,7 +62,7 @@ const DSLib = (() => {
        Scripts that declare a different REQUIRED_DSLIB_VERSION will
        refuse to start, forcing the user to update all scripts together.
     ==================================================================== */
-    const VERSION = '1.3';
+    const VERSION = '1.5';
     /* ====================================================================
        CONSTANTS
     ==================================================================== */
@@ -75,6 +97,23 @@ const DSLib = (() => {
     const INVENTORY_URL    = 'https://demonicscans.org/inventory.php';
     const PLAYER_STATS_URL = 'https://demonicscans.org/active_wave.php?gate=3&wave=3';
     const FORM_HEADERS     = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
+    /* ====================================================================
+       CLASS & MANA — URLs + Constants (v1.4)
+    ==================================================================== */
+    const CLASSES_URL = 'https://demonicscans.org/classes.php';
+    const BATTLE_URL  = 'https://demonicscans.org/battle.php';
+    const DAMAGE_URL  = 'https://demonicscans.org/damage.php';
+    /** Mana max (hardcoded — to be replaced by per-class lookup if the game changes). */
+    const MAX_MANA = 200;
+    /** Per-class skill definitions. id is sent to damage.php as skill_id ; manaCost is what the server actually deducts ; stamCost is what the API expects in the body field stamina_cost. */
+    const CLASS_SKILLS = {
+        Cleric: {
+            JUDGMENT_SEAL: { id: 9, manaCost: 30, stamCost: 1, name: 'Judgment Seal' }
+        }
+        // Other classes : add when their useful skills are documented.
+    };
+    /** Skills that Judgment Seal boosts (per game spec — v11.0). */
+    const JUDGMENT_BOOSTABLE_SKILLS = new Set(['LEGENDARY_SLASH', 'WORLD_BREAKER_SLASH']);
     /* ====================================================================
        UTILITIES
     ==================================================================== */
@@ -1242,6 +1281,273 @@ const DSLib = (() => {
         }
     };
 
+    /* ====================================================================
+       v1.4 — CLASS & MANA — Pure functions
+    ==================================================================== */
+    /** Parse current/max mana from any document containing "💠 N / N MP". */
+    function extractManaFromDoc(doc) {
+        try {
+            const text = doc?.body?.textContent || '';
+            const m = text.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)\s*MP/i);
+            if (!m) return null;
+            const current = parseInt(m[1].replace(/,/g, ''), 10);
+            const max     = parseInt(m[2].replace(/,/g, ''), 10);
+            if (Number.isNaN(current) || Number.isNaN(max)) return null;
+            return { current, max };
+        } catch (_) { return null; }
+    }
+    /** Fetch the player class from classes.php. Returns string ("Cleric") or null. */
+    async function fetchPlayerClass({ logFn = console.log } = {}) {
+        try {
+            const response = await fetch(CLASSES_URL, { credentials: 'same-origin' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+            const text = doc?.body?.textContent || '';
+            const m = text.match(/Your class\s*:\s*([A-Za-z][A-Za-z\s\-']{1,40})/i);
+            if (!m) { logFn('⚠️ [CLASS] Could not detect class from classes.php.'); return null; }
+            const cls = m[1].trim().split(/\s+/)[0];
+            logFn(`⚔️ [CLASS] Detected class: ${cls}`);
+            return cls;
+        } catch (err) {
+            logFn('⚠️ [CLASS] Class fetch failed.');
+            console.error('Class fetch failed', err);
+            return null;
+        }
+    }
+    /** Fetch current mana from a battle page. Auto-picks a monster id if none provided. */
+    async function fetchManaFromBattle(monsterId, { logFn = console.log } = {}) {
+        if (!monsterId) {
+            const anyCard = document.querySelector('.monster-container .monster-card');
+            monsterId = anyCard?.dataset?.monsterId;
+        }
+        if (!monsterId) {
+            try {
+                const resp = await fetch(PLAYER_STATS_URL, { credentials: 'same-origin' });
+                if (resp.ok) {
+                    const doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
+                    const any = doc.querySelector('.monster-container .monster-card');
+                    monsterId = any?.dataset?.monsterId;
+                }
+            } catch (_) {}
+        }
+        if (!monsterId) return null;
+        try {
+            const response = await fetch(`${BATTLE_URL}?id=${encodeURIComponent(monsterId)}`, { credentials: 'same-origin' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return extractManaFromDoc(new DOMParser().parseFromString(await response.text(), 'text/html'));
+        } catch (err) {
+            console.error('Mana fetch failed', err);
+            return null;
+        }
+    }
+    /** Cast a class skill via damage.php. Returns parsed JSON response or null. */
+    async function castClassSkill(monsterId, classSkill, { enableCalls = true, logFn = console.log } = {}) {
+        if (!enableCalls) {
+            logFn(`[SIMULATION] Cast ${classSkill.name} on ${monsterId}`);
+            return { simulated: true };
+        }
+        const stamCost = classSkill.stamCost ?? 1;
+        const body = `monster_id=${encodeURIComponent(monsterId)}&skill_id=${classSkill.id}&stamina_cost=${stamCost}`;
+        try {
+            const response = await fetch(DAMAGE_URL, {
+                method: 'POST',
+                headers: FORM_HEADERS,
+                body,
+                credentials: 'same-origin'
+            });
+            if (!response.ok && response.status !== 400) throw new Error(`HTTP ${response.status}`);
+            return await response.json().catch(() => null);
+        } catch (err) {
+            logFn(`⚠️ [CLASS] Cast ${classSkill.name} failed on ${monsterId} (${err.message || err})`);
+            console.error('Class skill cast failed:', err);
+            return null;
+        }
+    }
+    /* ====================================================================
+       v1.4 — JUDGMENT SEAL DECISIONS — Pure
+    ==================================================================== */
+    /** Returns the active Judgment Seal config for the player's class, or null. */
+    function getActiveJudgmentSeal(sharedSettings = {}) {
+        if (!sharedSettings.judgmentSealEnabled) return null;
+        const cls = sharedSettings.detectedClass;
+        if (!cls || !CLASS_SKILLS[cls]) return null;
+        return CLASS_SKILLS[cls].JUDGMENT_SEAL || null;
+    }
+    /** Decides whether Judgment Seal should be cast before a given skill. */
+    function shouldCastJudgmentSeal(skillName, isBoss, sharedSettings = {}) {
+        if (!getActiveJudgmentSeal(sharedSettings)) return false;
+        if (!JUDGMENT_BOOSTABLE_SKILLS.has(skillName)) return false;
+        const skillMatches =
+            (skillName === 'LEGENDARY_SLASH'     && sharedSettings.judgmentSealForLegendary) ||
+            (skillName === 'WORLD_BREAKER_SLASH' && sharedSettings.judgmentSealForWorldBreaker);
+        if (!skillMatches) return false;
+        return isBoss ? !!sharedSettings.judgmentSealForBosses : !!sharedSettings.judgmentSealForMonsters;
+    }
+    /* ====================================================================
+       v1.4 — MANA MANAGER (stateful)
+       Encapsule currentMana + counters + flags depleted.
+       Usage :
+         const mana = DSLib.createManaManager({
+             getSharedSettings: () => settings.shared(),
+             getMaxRefills:     () => settings.wave().maxManaRefills || 0,
+             enableCalls:       true,
+             logFn:             addLog,
+             onUiUpdate:        () => updateUiStats(...),
+         });
+         await mana.refresh(monsterId);
+         if (await mana.process()) { ... }
+         await mana.castSeal(monsterId, seal);
+    ==================================================================== */
+    function createManaManager({
+        maxMana = MAX_MANA,
+        getSharedSettings = () => ({}),
+        getMaxRefills    = () => 0,
+        enableCalls      = true,
+        logFn            = console.log,
+        onUiUpdate       = () => {},
+    } = {}) {
+        let _current = 0;
+        let _refillsUsed = 0;
+        let _potionSDepleted = false;
+        let _potionLDepleted = false;
+
+        async function refresh(monsterId) {
+            const m = await fetchManaFromBattle(monsterId, { logFn });
+            if (m && typeof m.current === 'number') {
+                _current = m.current;
+                try { onUiUpdate(_current); } catch (_) {}
+                return m;
+            }
+            return null;
+        }
+
+        async function process() {
+            if (_current >= maxMana) {
+                logFn(`💠 [MANA] Already at max (${_current}/${maxMana}). Skipping.`);
+                return false;
+            }
+            const sh = getSharedSettings() || {};
+            const maxR = Number(getMaxRefills()) || 0;
+            if (_refillsUsed >= maxR) {
+                logFn(`🛑 [MANA] Max mana refills reached (${_refillsUsed}/${maxR}).`);
+                return false;
+            }
+            const sAllowed = !!sh.useManaPotionS && !_potionSDepleted && !!sh.manaPotionSId;
+            const lAllowed = !!sh.useManaPotionL && !_potionLDepleted && !!sh.manaPotionLId;
+            if (!sAllowed && !lAllowed) {
+                logFn('🛑 [MANA] No mana potions allowed or available.');
+                return false;
+            }
+
+            const opts = { enableCalls, logFn };
+            let success = false;
+
+            const tryPot = async (kind) => {
+                if (kind === 'L') {
+                    const ok = await useItemByInvId(sh.manaPotionLId, 'Mana Potion L', opts);
+                    if (!ok) { logFn('⚠️ [MANA] Mana Potion L depleted.'); _potionLDepleted = true; }
+                    return ok;
+                } else {
+                    const ok = await useItemByInvId(sh.manaPotionSId, 'Mana Potion S', opts);
+                    if (!ok) { logFn('⚠️ [MANA] Mana Potion S depleted.'); _potionSDepleted = true; }
+                    return ok;
+                }
+            };
+
+            if (sAllowed && lAllowed) {
+                if (_current === 0) {
+                    logFn('💠 [MANA] Consuming Mana Potion L (mana = 0)...');
+                    success = await tryPot('L');
+                    if (!success) { logFn('⚠️ [MANA] Falling back to S.'); success = await tryPot('S'); }
+                } else {
+                    logFn(`💠 [MANA] Consuming Mana Potion S (mana ${_current})...`);
+                    success = await tryPot('S');
+                    if (!success) { logFn('⚠️ [MANA] Falling back to L.'); success = await tryPot('L'); }
+                }
+            } else if (lAllowed) {
+                logFn('💠 [MANA] Consuming Mana Potion L (only L allowed)...');
+                success = await tryPot('L');
+            } else if (sAllowed) {
+                logFn('💠 [MANA] Consuming Mana Potion S (only S allowed)...');
+                success = await tryPot('S');
+            }
+
+            if (success) {
+                _refillsUsed++;
+                logFn(`💠 [MANA] Mana refilled. Total: ${_refillsUsed}/${maxR}.`);
+            }
+            return success;
+        }
+
+        async function castSeal(monsterId, seal) {
+            const res = await castClassSkill(monsterId, seal, { enableCalls, logFn });
+            if (res) {
+                if (typeof res.mana === 'number') _current = res.mana;
+                else                              _current = Math.max(0, _current - (seal.manaCost || 0));
+                try { onUiUpdate(_current); } catch (_) {}
+            }
+            return res;
+        }
+
+        return {
+            getCurrent:           () => _current,
+            setCurrent:           (n) => { _current = Math.max(0, Number(n) || 0); try { onUiUpdate(_current); } catch (_) {} },
+            getMax:               () => maxMana,
+            getRefillsUsed:       () => _refillsUsed,
+            isPotionSDepleted:    () => _potionSDepleted,
+            isPotionLDepleted:    () => _potionLDepleted,
+            resetCounters:        () => { _refillsUsed = 0; _potionSDepleted = false; _potionLDepleted = false; },
+            refresh,
+            process,
+            castSeal,
+        };
+    }
+    /* ==================================================================== */
+    /* ====================================================================
+       v1.5 — KILL SWITCH (Niveau 3 : manifest distant bloquant)
+       Permet de désactiver à distance des versions de DSLib publiées,
+       sans nécessiter une réinstallation des userscripts qui en dépendent.
+       Le manifest est fetché au démarrage de la lib. Si la version courante
+       est dans killedVersions OU si VERSION < minSupported, DSLib.ready
+       résout avec { ok:false, reason }. Les scripts attendent DSLib.ready
+       et refusent de démarrer en cas de kill.
+       Offline / 404 → permissif (on ne casse pas tout le monde).
+    ==================================================================== */
+    const MANIFEST_URL = 'https://cdn.jsdelivr.net/gh/Niokhy/MDG-scripts@latest/manifest.json';
+    function compareVersions(a, b) {
+        const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+        const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+            const da = pa[i] || 0, db = pb[i] || 0;
+            if (da < db) return -1;
+            if (da > db) return 1;
+        }
+        return 0;
+    }
+    const _ready = (async () => {
+        try {
+            const resp = await fetch(MANIFEST_URL, { cache: 'no-store', credentials: 'omit' });
+            if (!resp.ok) {
+                console.warn(`[DSLib] Manifest fetch HTTP ${resp.status} — staying permissive.`);
+                return { ok: true, manifest: null };
+            }
+            const m = await resp.json();
+            if (Array.isArray(m.killedVersions) && m.killedVersions.includes(VERSION)) {
+                const reason = m.killMessage || `DSLib v${VERSION} has been retired by the publisher.`;
+                console.error(`[DSLib] Killed (${VERSION}): ${reason}`);
+                return { ok: false, reason, manifest: m };
+            }
+            if (m.minSupported && compareVersions(VERSION, m.minSupported) < 0) {
+                const reason = m.killMessage || `Minimum supported DSLib version is ${m.minSupported} (current: ${VERSION}).`;
+                console.error(`[DSLib] Below minSupported: ${reason}`);
+                return { ok: false, reason, manifest: m };
+            }
+            return { ok: true, manifest: m };
+        } catch (e) {
+            console.warn('[DSLib] Manifest check failed (network/parse error) — staying permissive.', e);
+            return { ok: true, manifest: null };
+        }
+    })();
     /* ==================================================================== */
     return {
         VERSION,
@@ -1272,5 +1578,15 @@ const DSLib = (() => {
         wireTabs,
         runSkillPlan,
         iframe,
+        // v1.4 — Class & Mana
+        MAX_MANA, CLASS_SKILLS, JUDGMENT_BOOSTABLE_SKILLS,
+        CLASSES_URL, BATTLE_URL, DAMAGE_URL,
+        extractManaFromDoc, fetchPlayerClass, fetchManaFromBattle, castClassSkill,
+        getActiveJudgmentSeal, shouldCastJudgmentSeal,
+        createManaManager,
+        // v1.5 — Kill switch
+        ready: _ready,
+        compareVersions,
+        MANIFEST_URL,
     };
 })();

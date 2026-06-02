@@ -1,0 +1,7 @@
+{
+  "_doc": "Manifest DSLib — édite ce fichier puis commit/push pour activer le kill switch sur les versions diffusées. La propagation jsDelivr prend ~5 min via @latest. minSupported : version min acceptée (semver). killedVersions : versions explicitement bannies. killMessage : message affiché aux users tués. currentLatest : version recommandée à installer (informatif).",
+  "minSupported": "1.4",
+  "killedVersions": [],
+  "killMessage": "",
+  "currentLatest": "1.5"
+}
