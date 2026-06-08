@@ -62,7 +62,7 @@ const DSLib = (() => {
        Scripts that declare a different REQUIRED_DSLIB_VERSION will
        refuse to start, forcing the user to update all scripts together.
     ==================================================================== */
-    const VERSION = '1.5';
+    const VERSION = '1.6';
     /* ====================================================================
        CONSTANTS
     ==================================================================== */
@@ -360,6 +360,60 @@ const DSLib = (() => {
         if (html.includes('/cdn-cgi/challenge-platform/'))                           return true;
         if (doc.querySelector('form#challenge-form, #cf-challenge-running, .cf-browser-verification')) return true;
         return false;
+    }
+    /* ====================================================================
+       v1.6 — STACK SUPPORT
+       The "Show unclaimed kills" page on demonicscans.org groups dead
+       monsters of the same name into stacks (max 250 per stack). The DOM
+       still emits one .monster-card per stack, with all the usual
+       data-* attributes (data-monster-id, data-dead, data-eligible,
+       data-userdmg, data-name), PLUS a <div class="stack-badge">Stack xN</div>
+       inside the card. data-userdmg applies per-monster (the whole stack
+       is uniformly battled).
+
+       For counting purposes (quest progress, ready/inProgress counters),
+       each card must be multiplied by its stack count. For loot, a single
+       loot.php call with the card's monster-id empties the entire stack.
+    ==================================================================== */
+    /**
+     * Lit la pastille .stack-badge à l'intérieur d'une monster-card et
+     * renvoie le nombre de monstres dans le stack. Retourne 1 si la
+     * pastille est absente (compat ascendante — cards sans stack).
+     */
+    function getStackCount(card) {
+        if (!card || typeof card.querySelector !== 'function') return 1;
+        const badge = card.querySelector('.stack-badge');
+        if (!badge) return 1;
+        const m = (badge.textContent || '').match(/(\d+)/);
+        if (!m) return 1;
+        const n = parseInt(m[1], 10);
+        return Number.isFinite(n) && n > 0 ? n : 1;
+    }
+    /**
+     * Helper qui somme les stack counts d'un ensemble de cards. Pratique
+     * pour les compteurs ready/inProgress qui passaient avant par .length.
+     */
+    function sumStackCounts(cards) {
+        if (!cards) return 0;
+        let total = 0;
+        for (const c of cards) total += getStackCount(c);
+        return total;
+    }
+    /**
+     * Pour les fonctions qui sélectionnent les targets à looter en visant
+     * un total cumulatif (ex: kill 10 monstres), retourne le sous-ensemble
+     * de cards dont la somme des stack counts atteint targetCount. Garantit
+     * d'en prendre au moins une si la liste n'est pas vide.
+     */
+    function pickCardsForCount(cards, targetCount) {
+        const picked = [];
+        let collected = 0;
+        for (const c of (cards || [])) {
+            if (collected >= targetCount) break;
+            picked.push(c);
+            collected += getStackCount(c);
+        }
+        return { picked, collected };
     }
     /* ====================================================================
        CSS INJECTION
@@ -1539,12 +1593,12 @@ const DSLib = (() => {
             }
             if (m.minSupported && compareVersions(VERSION, m.minSupported) < 0) {
                 const reason = m.killMessage || `Minimum supported DSLib version is ${m.minSupported} (current: ${VERSION}).`;
-                console.error(`[DSLib] Below minSupported: ${reason}`);
+                console.error(`[DSLib] Min-support gate failed (${VERSION} < ${m.minSupported}): ${reason}`);
                 return { ok: false, reason, manifest: m };
             }
             return { ok: true, manifest: m };
         } catch (e) {
-            console.warn('[DSLib] Manifest check failed (network/parse error) — staying permissive.', e);
+            console.warn('[DSLib] Manifest fetch threw — staying permissive.', e);
             return { ok: true, manifest: null };
         }
     })();
@@ -1588,5 +1642,9 @@ const DSLib = (() => {
         ready: _ready,
         compareVersions,
         MANIFEST_URL,
+        // v1.6 — Stack support (Show unclaimed kills)
+        getStackCount,
+        sumStackCounts,
+        pickCardsForCount,
     };
 })();
