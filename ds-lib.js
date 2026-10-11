@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DSLib — Shared utilities for Demonicscans automators
 // @namespace    demonicscans-lib
-// @version      1.5
+// @version      1.7
 // @description  Shared constants, utilities, CSS and API helpers for DS automator scripts
 // @author       Niokhy
 // ==/UserScript==
@@ -53,6 +53,47 @@
  *   - Usage côté script :
  *        const r = await DSLib.ready;
  *        if (!r.ok) { console.error(r.reason); return; }
+ *
+ * v1.6 (mineure) — Stack support : getStackCount, sumStackCounts, pickCardsForCount.
+ *
+ * v1.7 (mineure) — Refactorisation Veyra 1.137 (helpers extraits du script) :
+ *   - Nouveaux helpers :
+ *       • fetchDoc(url, { throwOnError, noStore, withHtml })  — GET → Document
+ *       • withCookie(name, value, asyncFn)                   — bascule temporaire d'un cookie
+ *       • formatCountdown(ms)                                — "2h 5m" / "5m 12s" / "12s"
+ *       • loadCounters(key, names, opts) / saveCounters(key, obj, opts)
+ *                                                            — compteurs de session (toNonNeg)
+ *       • createJsonStore(key, { storage, fallback })        — petit état JSON persistant
+ *       • createTypedLogBuffer({ elementId, max, ... })      — console typée info/success/warn/error
+ *       • createHourlyScheduler({ getIntervalMs, run, ... }) — cycle setTimeout enchaîné + runNow
+ *       • renderOrderList(container, opts)                   — liste drag & drop + toggle
+ *       • makeElementDraggable(el, opts)                     — drag d'un panel/modal + persistance
+ *   - processLootItems : accepte aussi les clés MAJUSCULES (ITEM_ID, NAME, IMAGE_URL, TIER,
+ *     QUANTITY, COUNT) — la normalisation dupliquée dans Veyra (Wave + Dungeon) est supprimée.
+ *   - castClassSkill / fetchManaFromBattle / createManaManager.refresh+castSeal :
+ *     la cible peut aussi être un monstre de donjon { instanceId, dgmid }
+ *     (damage.php reçoit instance_id + dgmid, battle.php?dgmid=&instance_id=).
+ *   - runHitLoop({ plan, cap, startDmg, attack, refillStamina, heal, beforeHit, onResult,
+ *     stop, messages… }) — boucle de coups (ex-runDungeonHits de Veyra) ; runSkillPlan
+ *     reste disponible mais n'est utilisé par aucun script.
+ *   - createChallengeGuard : options shouldContinue, checkOrder, messages.
+ *   - createReloadGuard : options lockKey/lockMs + méthodes request(reason, { onReload, onLimit }),
+ *     isLocked(), lockUntil(), clearLock() (tryReload inchangé).
+ *   - createManaManager : Full Mana Potion (useManaPotionF + fullManaPotionId) ;
+ *     ordre F→L→S à mana 0, S→L→F sinon ; isPotionFDepleted().
+ *   - fetchInventoryPage / invalidateInventoryCache : lecture partagée d'inventory.php
+ *     (cache 5 s, requête en vol partagée) ; fetchInventoryIds l'utilise.
+ *   - handleStaminaLogic : options onPotionFail/stopFn, refillCountMode, logPrefix ;
+ *     retourne aussi `stopped`.
+ *   - handleStaminaLogic : option isRunning: () => bool (la boucle SSP gap-fill voit un Stop
+ *     en cours de route ; le booléen `running` reste accepté).
+ *   - iframe.withHidden(url, fn, { width, height, timeoutMs }) — crée/charge/exécute/supprime
+ *     toujours ; iframe.muteDialogs(iframeOrWindow).
+ *   - ⚠ Contrat modifié (aucun consommateur avant Veyra 1.137) :
+ *   - iframe.create ajoute aria-hidden ; iframe.waitFor accepte un prédicat synchrone et son
+ *     message d'erreur devient "waitFor timeout: <label>" ; iframe.simulateDrag reprend la
+ *     version éprouvée de Veyra (scrollIntoView, pointermove/up aussi sur document,
+ *     buttons:0 au pointerup, pointerId/isPrimary/view) — options steps/stepMs/holdMs/onCoords.
  */
 const DSLib = (() => {
     'use strict';
@@ -62,7 +103,7 @@ const DSLib = (() => {
        Scripts that declare a different REQUIRED_DSLIB_VERSION will
        refuse to start, forcing the user to update all scripts together.
     ==================================================================== */
-    const VERSION = '1.6';
+    const VERSION = '1.7';
     /* ====================================================================
        CONSTANTS
     ==================================================================== */
@@ -548,12 +589,40 @@ const DSLib = (() => {
         'Large Mana Potion',
         'Small Mana Potion'
     ]);
-    async function fetchInventoryIds({ onUpdate, logFn = console.log, extraNames } = {}) {
+    /* ====================================================================
+       v1.7 — SHARED inventory.php READ (short cache)
+       Several modules read inventory.php at the same moment (potion stocks,
+       potion ID sync, auto-detect…). One request is shared: concurrent calls
+       reuse the in-flight request, and a result younger than maxAgeMs is
+       reused. Using an item (useItemByInvId) invalidates the cache.
+       Resolves { doc, html } — or null on HTTP error; rejects on network error.
+    ==================================================================== */
+    const INVENTORY_CACHE_MS = 5000;
+    let _invCache = { at: 0, page: null, inFlight: null };
+    function invalidateInventoryCache() { _invCache = { at: 0, page: null, inFlight: null }; }
+    function fetchInventoryPage({ maxAgeMs = INVENTORY_CACHE_MS } = {}) {
+        if (_invCache.page && Date.now() - _invCache.at < maxAgeMs) return Promise.resolve(_invCache.page);
+        if (_invCache.inFlight) return _invCache.inFlight;
+        const p = (async () => {
+            const response = await fetch(INVENTORY_URL, { credentials: 'same-origin' });
+            if (!response.ok) return null;
+            const html = await response.text();
+            return { doc: new DOMParser().parseFromString(html, 'text/html'), html };
+        })();
+        _invCache.inFlight = p;
+        p.then(page => {
+            if (_invCache.inFlight !== p) return;            // invalidated meanwhile
+            _invCache = { at: Date.now(), page, inFlight: null };
+        }, () => { if (_invCache.inFlight === p) _invCache.inFlight = null; });
+        return p;
+    }
+
+    async function fetchInventoryIds({ onUpdate, logFn = console.log, extraNames, maxAgeMs } = {}) {
         const names = extraNames ? new Set([...POTION_NAMES, ...extraNames]) : POTION_NAMES;
         try {
-            const response = await fetch(INVENTORY_URL, { credentials: 'same-origin' });
-            if (!response.ok) return;
-            const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+            const page = await fetchInventoryPage({ maxAgeMs });
+            if (!page) return;
+            const doc = page.doc;
             let anyUpdated = false;
             doc.querySelectorAll('.potion-card').forEach(card => {
                 const nameNode = card.querySelector('.potion-name span');
@@ -583,6 +652,7 @@ const DSLib = (() => {
         }
         try {
             const response = await postForm(USE_ITEM_URL, { inv_id: invId });
+            invalidateInventoryCache();   // v1.7 — stocks changed
             const text = await response.text();
             if (text.includes('Item not found or not usable')) return false;
             return true;
@@ -606,6 +676,19 @@ const DSLib = (() => {
     /* ====================================================================
        STAMINA REFILL LOGIC
     ==================================================================== */
+    /**
+     * Stamina refill tiers: SSP gap-fill → Large → Full → plain SSP.
+     * v1.7 options (defaults = historical behaviour):
+     *   isRunning()        — live running flag (preferred over the `running` boolean);
+     *                        once false, no further potion is used.
+     *   onPotionFail       — 'continue' (default) or 'stop': a failed potion call
+     *                        calls stopFn('Stamina potion failed') and ends the logic.
+     *   stopFn(reason)     — used with onPotionFail:'stop'.
+     *   refillCountMode    — 'lspFsp' (default: only Large/Full count toward
+     *                        maxStaminaRefills) or 'any' (any successful refill counts once).
+     *   logPrefix          — inserted after the emoji of every log line (e.g. '[AUTO] ').
+     * Returns { success, stopped, currentStamina, staminaRefillsUsed, sspRefillsUsed, largePotionsDepleted }.
+     */
     async function handleStaminaLogic(ctx) {
         const {
             enableCalls           = true,
@@ -622,6 +705,11 @@ const DSLib = (() => {
             largeStaminaPotionId  = 0,
             fullStaminaPotionId   = 0,
             running               = true,
+            isRunning             = null,
+            onPotionFail          = 'continue',
+            stopFn                = () => {},
+            refillCountMode       = 'lspFsp',
+            logPrefix             = '',
             currentExpRatio       = 0,
             logFn                 = console.log,
             persistStatsFn        = () => {}
@@ -630,74 +718,104 @@ const DSLib = (() => {
         let staminaRefillsUsed   = ctx.staminaRefillsUsed   ?? 0;
         let sspRefillsUsed       = ctx.sspRefillsUsed       ?? 0;
         let largePotionsDepleted = ctx.largePotionsDepleted ?? false;
-        const ret = () => ({ success, currentStamina, staminaRefillsUsed, sspRefillsUsed, largePotionsDepleted });
-        let success = false;
+        let success = false, stopped = false, lspFspUsed = false;
+        const ret = () => ({ success, stopped, currentStamina, staminaRefillsUsed, sspRefillsUsed, largePotionsDepleted });
+        const stillRunning = () => (typeof isRunning === 'function' ? !!isRunning() : running);
+        // '🧪 text' → '🧪 [AUTO] text' when logPrefix is set
+        const log = (msg) => logFn(logPrefix ? String(msg).replace(/^(\S+)\s/, `$1 ${logPrefix}`) : msg);
+        const opts = { enableCalls, logFn };
+        const usePotion = async (invId, label) => {
+            const ok = await useItemByInvId(invId, label, opts);
+            if (!ok && onPotionFail === 'stop') { stopFn('Stamina potion failed'); stopped = true; }
+            return ok;
+        };
+        // Ends the logic after a potion failure in 'stop' mode (success forced
+        // false), or when automation was stopped meanwhile (no further potion).
+        // A potion that already succeeded is still counted when the automation
+        // was stopped meanwhile (it has been consumed).
+        let counted = false;
+        const countRefill = (lspFsp) => {
+            if (counted) return;
+            if (refillCountMode === 'any' || lspFsp) {
+                counted = true;
+                staminaRefillsUsed++;
+                persistStatsFn();
+                log(refillCountMode === 'any'
+                    ? `⚡ Stamina Refilled. Total Used: ${staminaRefillsUsed}/${maxStaminaRefills}`
+                    : `⚡ Stamina Refilled. Total LSP/FSP used: ${staminaRefillsUsed}/${maxStaminaRefills}`);
+            }
+        };
+        const halted = () => {
+            if (stopped) { success = false; return true; }
+            if (!stillRunning()) { stopped = true; if (success) countRefill(lspFspUsed); return true; }
+            return false;
+        };
+
         if (currentExpRatio >= expThreshold) {
-            logFn(`📉 EXP Threshold reached (${(currentExpRatio * 100).toFixed(1)}%). Stopping refills.`);
+            log(`📉 EXP Threshold reached (${(currentExpRatio * 100).toFixed(1)}%). Stopping refills.`);
             return ret();
         }
         if (staminaRefillsUsed >= maxStaminaRefills) {
-            logFn(`🛑 Max refills reached (${staminaRefillsUsed}/${maxStaminaRefills}). Stopping refills.`);
+            log(`🛑 Max refills reached (${staminaRefillsUsed}/${maxStaminaRefills}). Stopping refills.`);
             return ret();
         }
         if (!useLargeStamina && !useFullStamina && !enableSsp && !sspFillGap) {
-            logFn('🛑 No stamina potion type enabled. Stopping refills.');
+            log('🛑 No stamina potion type enabled. Stopping refills.');
             return ret();
         }
-        const opts = { enableCalls, logFn };
         if (!success && sspFillGap && sspRefillsUsed < maxSspRefills && smallStaminaPotionId) {
             if (currentStamina > sspMinThreshold) {
-                logFn(`🧪 SSP gap-fill: stamina ${currentStamina} > min ${sspMinThreshold}. Filling toward ${staminaThreshold}…`);
-                while (currentStamina < staminaThreshold && sspRefillsUsed < maxSspRefills && running) {
-                    const ok = await useItemByInvId(smallStaminaPotionId, 'Small Stamina Potion', opts);
-                    if (!ok) { logFn('⚠️ Out of Small Stamina Potions.'); break; }
+                log(`🧪 SSP gap-fill: stamina ${currentStamina} > min ${sspMinThreshold}. Filling toward ${staminaThreshold}…`);
+                while (currentStamina < staminaThreshold && sspRefillsUsed < maxSspRefills && stillRunning()) {
+                    const ok = await usePotion(smallStaminaPotionId, 'Small Stamina Potion');
+                    if (!ok) { log('⚠️ Out of Small Stamina Potions.'); break; }
                     sspRefillsUsed++;
                     currentStamina += 20;
                     persistStatsFn();
-                    logFn(`⚡ SSP used (${sspRefillsUsed}/${maxSspRefills}). Stamina ~${currentStamina}.`);
+                    log(`⚡ SSP used (${sspRefillsUsed}/${maxSspRefills}). Stamina ~${currentStamina}.`);
                 }
+                if (halted()) return ret();
                 success = currentStamina >= staminaThreshold;
             } else {
-                logFn(`⏭️ SSP gap-fill skipped: stamina ${currentStamina} ≤ min ${sspMinThreshold}. Trying LSP/FSP.`);
+                log(`⏭️ SSP gap-fill skipped: stamina ${currentStamina} ≤ min ${sspMinThreshold}. Trying LSP/FSP.`);
             }
         }
-        let lspFspUsed = false;
         if (!success && useLargeStamina && !largePotionsDepleted) {
-            logFn('🧪 Consuming Large Stamina Potion…');
-            success = await useItemByInvId(largeStaminaPotionId, 'Large Stamina Potion', opts);
+            log('🧪 Consuming Large Stamina Potion…');
+            success = await usePotion(largeStaminaPotionId, 'Large Stamina Potion');
             if (!success) {
-                logFn('⚠️ Out of Large Stamina Potions. Marking as depleted.');
+                log('⚠️ Out of Large Stamina Potions. Marking as depleted.');
                 largePotionsDepleted = true;
             } else {
                 lspFspUsed = true;
             }
         }
+        if (halted()) return ret();
         if (!success && useFullStamina) {
-            logFn('🧪 Consuming Full Stamina Potion…');
-            success = await useItemByInvId(fullStaminaPotionId, 'Full Stamina Potion', opts);
+            log('🧪 Consuming Full Stamina Potion…');
+            success = await usePotion(fullStaminaPotionId, 'Full Stamina Potion');
             if (success) lspFspUsed = true;
         }
+        if (halted()) return ret();
         if (!success && enableSsp && sspRefillsUsed < maxSspRefills && smallStaminaPotionId) {
-            logFn('🧪 Consuming Small Stamina Potion…');
-            const ok = await useItemByInvId(smallStaminaPotionId, 'Small Stamina Potion', opts);
+            log('🧪 Consuming Small Stamina Potion…');
+            const ok = await usePotion(smallStaminaPotionId, 'Small Stamina Potion');
             if (ok) {
                 sspRefillsUsed++;
                 persistStatsFn();
-                logFn(`🧪 SSP used. Total: ${sspRefillsUsed}/${maxSspRefills}`);
+                log(`🧪 SSP used. Total: ${sspRefillsUsed}/${maxSspRefills}`);
                 success = true;
             }
+            if (halted()) return ret();
         }
         if (success) {
-            if (lspFspUsed) {
-                staminaRefillsUsed++;
-                persistStatsFn();
-                logFn(`⚡ Stamina Refilled. Total LSP/FSP used: ${staminaRefillsUsed}/${maxStaminaRefills}`);
-            }
+            countRefill(lspFspUsed);
         } else {
-            logFn('⚠️ No usable Stamina Potions found.');
+            log('⚠️ No usable Stamina Potions found.');
         }
         return ret();
     }
+
     /* ====================================================================
        LOOT TRACKING
     ==================================================================== */
@@ -705,17 +823,18 @@ const DSLib = (() => {
         if (!items || !Array.isArray(items)) return;
         items.forEach(item => {
             if (!item) return;
-            const id = item.id || item.inv_id || item.item_id;
+            // v1.7 — also accepts the UPPERCASE keys some endpoints return.
+            const id = item.id || item.inv_id || item.item_id || item.ITEM_ID;
             if (!id) return;
             if (!lootTracker[id]) {
                 lootTracker[id] = {
                     count: 0,
-                    img:   item.img   || item.image || '',
-                    name:  item.name  || '',
-                    tier:  (item.tier || 'COMMON').toUpperCase()
+                    img:   item.img   || item.image || item.IMAGE_URL || '',
+                    name:  item.name  || item.NAME  || '',
+                    tier:  (item.tier || item.TIER  || 'COMMON').toUpperCase()
                 };
             }
-            lootTracker[id].count += (item.quantity || item.count || 1);
+            lootTracker[id].count += (item.quantity || item.QUANTITY || item.count || item.COUNT || 1);
         });
     }
     /* ====================================================================
@@ -898,6 +1017,15 @@ const DSLib = (() => {
     /* ====================================================================
        v1.3 — CHALLENGE GUARD (Cloudflare)
     ==================================================================== */
+    /**
+     * Waits for a Cloudflare challenge to clear (poll every pollMs).
+     * v1.7 options (defaults = historical behaviour):
+     *   shouldContinue()  — polled first on each tick; false → stops silently
+     *                       (e.g. automation stopped meanwhile).
+     *   checkOrder        — 'timeoutFirst' (default) or 'clearFirst'.
+     *   messages          — { detected(reason), cleared, timeout }: string,
+     *                       function or null (= no log) to override each log line.
+     */
     function createChallengeGuard({
         pollMs   = 2500,
         timeoutMs = 120000,
@@ -905,30 +1033,48 @@ const DSLib = (() => {
         onClear  = () => {},
         onTimeout = () => {},
         logFn    = console.log,
+        shouldContinue = () => true,
+        checkOrder = 'timeoutFirst',
+        messages = {},
     } = {}) {
         let _timerId  = null;
         let _startAt  = 0;
         const _active = () => _timerId !== null;
+        const DEFAULT_MSGS = {
+            detected: (reason) => `🛡️ Cloudflare challenge detected${reason ? ` (${reason})` : ''}. Waiting…`,
+            cleared:  '✅ Challenge cleared — resuming.',
+            timeout:  '⏱️ Challenge wait timed out.',
+        };
+        const say = (key, arg) => {
+            const m = (key in messages) ? messages[key] : DEFAULT_MSGS[key];
+            if (m === null || m === undefined) return;
+            logFn(typeof m === 'function' ? m(arg) : m);
+        };
 
         function tick() {
-            if (Date.now() - _startAt >= timeoutMs) {
+            if (!shouldContinue()) { stop(); return; }
+            const timedOut = () => {
+                if (Date.now() - _startAt < timeoutMs) return false;
                 stop();
-                logFn('⏱️ Challenge wait timed out.');
+                say('timeout');
                 try { onTimeout('timeout'); } catch (_) {}
-                return;
-            }
-            if (!isChallenge()) {
+                return true;
+            };
+            const cleared = () => {
+                if (isChallenge()) return false;
                 stop();
-                logFn('✅ Challenge cleared — resuming.');
+                say('cleared');
                 try { onClear(); } catch (_) {}
-                return;
-            }
+                return true;
+            };
+            if (checkOrder === 'clearFirst') { if (!cleared()) timedOut(); }
+            else                             { if (!timedOut()) cleared(); }
         }
 
         function schedule(reason) {
             if (_active()) return;
             _startAt = Date.now();
-            logFn(`🛡️ Cloudflare challenge detected${reason ? ` (${reason})` : ''}. Waiting…`);
+            say('detected', reason);
             _timerId = setInterval(tick, pollMs);
         }
         function stop() {
@@ -1001,7 +1147,7 @@ const DSLib = (() => {
     /* ====================================================================
        v1.3 — RELOAD GUARD
     ==================================================================== */
-    function createReloadGuard({ storageKey, maxReloads = 3, windowMs = 120000 } = {}) {
+    function createReloadGuard({ storageKey, maxReloads = 3, windowMs = 120000, lockKey = null, lockMs = 10 * 60 * 1000 } = {}) {
         if (!storageKey) throw new Error('[DSLib] createReloadGuard: storageKey required');
 
         const _load = () => {
@@ -1037,6 +1183,32 @@ const DSLib = (() => {
                 try { location.reload(); } catch (_) {}
                 return true;
             },
+            /**
+             * v1.7 — reload request with a persistent lock once the limit is hit.
+             * Counts within windowMs (count = 1 outside the window); beyond
+             * maxReloads: sets the lock (lockKey/lockMs), calls onLimit(max) and
+             * returns false WITHOUT clearing the counter (a pending reload must
+             * not restart at 1 → endless loop). Otherwise onReload(count, max)
+             * then location.reload(), returns true. No log of its own.
+             */
+            request(reason, { onReload = () => {}, onLimit = () => {} } = {}) {
+                const t = Date.now();
+                const g = _load();
+                const inWindow = g.firstAt > 0 && (t - g.firstAt) < windowMs;
+                const next = { count: inWindow ? g.count + 1 : 1, firstAt: inWindow ? g.firstAt : t };
+                _save(next);
+                if (next.count > maxReloads) {
+                    if (lockKey) { try { sessionStorage.setItem(lockKey, String(t + lockMs)); } catch (_) {} }
+                    try { onLimit(maxReloads); } catch (_) {}
+                    return false;
+                }
+                try { onReload(next.count, maxReloads); } catch (_) {}
+                try { location.reload(); } catch (_) {}
+                return true;
+            },
+            lockUntil() { if (!lockKey) return 0; try { return Number(sessionStorage.getItem(lockKey)) || 0; } catch (_) { return 0; } },
+            isLocked()  { return this.lockUntil() > Date.now(); },
+            clearLock() { if (lockKey) { try { sessionStorage.removeItem(lockKey); } catch (_) {} } },
             clear() { try { sessionStorage.removeItem(storageKey); } catch (_) {} },
             status() { return _load(); }
         };
@@ -1269,69 +1441,204 @@ const DSLib = (() => {
     }
 
     /* ====================================================================
+       v1.7 — HIT LOOP (extracted from Veyra's Dungeon runDungeonHits)
+       Runs a plan of hits on one target: cap check before each hit, stamina
+       refill + retry of the same hit, optional pre-hit hook (Judgment Seal),
+       server "Not enough stamina" (refill + retry) / "You are dead" (heal +
+       one retry) handling, per-hit result hook, kill detection.
+       The damage is the absolute total sent back by damage.php (totaldmgdealt).
+       Returns { dmg, reason } — reason: 'done' | 'cap' | 'killed' | 'error' |
+       'stopped' (isRunning() false) | 'aborted' (stop(reason) was called).
+    ==================================================================== */
+    const HIT_LOOP_MSGS = {
+        capNext:       'Moving to next.',
+        errorNext:     'Moving to next monster.',
+        lowStamina:    (have, cost) => `📉 Not enough stamina for ${cost}-cost skill (have ${have}). Using potion...`,
+        serverLowLog:  '📉 Server: not enough stamina. Using potion...',
+        serverLowStop: 'Server reported not enough stamina and refill failed.',
+        noPotionStop:  'Out of stamina and no potion available.',
+        retryLog:      (n, total) => `💥 Retrying attack ${n}/${total}...`,
+        retryFallback: 'Network Error',
+        hit:           (n, total, dmg) => `💥 Attack ${n}/${total} OK. Total dmg: ${dmg}`,
+    };
+    async function runHitLoop({
+        plan = [], cap = Infinity, startDmg = 0, name = 'target',
+        isRunning = () => true,
+        getStamina = () => Infinity,
+        refillStamina = async () => false,   // → true when stamina was refilled
+        beforeHit = async () => {},          // (skill, index)
+        attack,                              // (skill) → damage.php JSON | null
+        heal = async () => {},
+        onResult = async () => {},           // (result) — stamina / HP / UI updates
+        stop = () => {},                     // (reason) — stops the automation
+        logFn = console.log,
+        messages = {},
+    } = {}) {
+        if (typeof attack !== 'function') throw new Error('[DSLib] runHitLoop: attack(fn) required');
+        const M = { ...HIT_LOOP_MSGS, ...messages };
+        const total = plan.length;
+        let dmg = startDmg;
+        for (let i = 0; i < total; i++) {
+            if (!isRunning()) return { dmg, reason: 'stopped' };
+            if (cap !== Infinity && dmg >= cap) {
+                logFn(`🛑 Cap reached (${dmg.toLocaleString()} / ${cap.toLocaleString()}). ${M.capNext}`);
+                return { dmg, reason: 'cap' };
+            }
+            const skill = plan[i];
+            if (getStamina() < skill.cost) {
+                logFn(M.lowStamina(getStamina(), skill.cost));
+                if (!(await refillStamina())) { stop(M.noPotionStop); return { dmg, reason: 'aborted' }; }
+                i--;
+                continue;
+            }
+            await beforeHit(skill, i);
+            let result = await attack(skill);
+            if (!result || result.status !== 'success') {
+                const errorMsg = String(result?.message ?? 'Network Error');
+                if (errorMsg.includes('Not enough stamina')) {
+                    if (M.serverLowLog) logFn(M.serverLowLog);
+                    if (!(await refillStamina())) { stop(M.serverLowStop); return { dmg, reason: 'aborted' }; }
+                    i--;
+                    continue;
+                } else if (errorMsg.includes('You are dead')) {
+                    logFn('🚑 HP Critical! Healing...');
+                    await heal();
+                    if (M.retryLog) logFn(M.retryLog(i + 1, total));
+                    const retry = await attack(skill);
+                    if (!retry || retry.status !== 'success') {
+                        stop(`Retry after heal failed: ${String(retry?.message ?? M.retryFallback)}`);
+                        return { dmg, reason: 'aborted' };
+                    }
+                    result = retry;
+                } else {
+                    logFn(`🛑 Attack error: ${errorMsg}. ${M.errorNext}`);
+                    return { dmg, reason: 'error' };
+                }
+            }
+            await onResult(result);
+            dmg = result.totaldmgdealt || 0;
+            logFn(M.hit(i + 1, total, dmg.toLocaleString()));
+            if (result.hp && result.hp.value <= 0) { logFn(`💀 ${name} Defeated!`); return { dmg, reason: 'killed' }; }
+        }
+        return { dmg, reason: 'done' };
+    }
+
+    /* ====================================================================
        v1.3 — IFRAME HELPERS
     ==================================================================== */
     const iframe = {
         create(width = 1, height = 1) {
             const f = document.createElement('iframe');
             f.style.cssText = `position:fixed; left:-9999px; top:-9999px; width:${width}px; height:${height}px; border:0; visibility:hidden;`;
+            f.setAttribute('aria-hidden', 'true');   // v1.7
             document.body.appendChild(f);
             return f;
         },
         async waitForLoad(iframeEl, { timeoutMs = 30000 } = {}) {
             return new Promise((resolve, reject) => {
                 let done = false;
-                const t = setTimeout(() => {
-                    if (done) return;
-                    done = true;
-                    reject(new Error('iframe load timeout'));
-                }, timeoutMs);
-                iframeEl.addEventListener('load', () => {
+                const onLoad = () => {
                     if (done) return;
                     done = true;
                     clearTimeout(t);
                     resolve(iframeEl);
-                }, { once: true });
+                };
+                const t = setTimeout(() => {
+                    if (done) return;
+                    done = true;
+                    iframeEl.removeEventListener('load', onLoad);
+                    reject(new Error('iframe load timeout'));
+                }, timeoutMs);
+                iframeEl.addEventListener('load', onLoad, { once: true });
             });
         },
-        async waitFor(predicate, { timeoutMs = 30000, intervalMs = 200, label = 'condition' } = {}) {
+        /**
+         * v1.7 — create a hidden iframe, load `url`, run fn(iframeEl) and ALWAYS
+         * remove the iframe afterwards (success, error or timeout). Resolves
+         * with fn's result; rejects with the load timeout or fn's error.
+         */
+        async withHidden(url, fn, { width = 1280, height = 800, timeoutMs = 20000 } = {}) {
+            const f = iframe.create(width, height);
+            try {
+                f.src = url;
+                await iframe.waitForLoad(f, { timeoutMs });
+                return await fn(f);
+            } finally {
+                try { f.remove(); } catch (_) {}
+            }
+        },
+        /** v1.7 — neutralise confirm/alert/prompt of an iframe (element) or a window. */
+        muteDialogs(target) {
+            try {
+                const w = (target && target.contentWindow) ? target.contentWindow : target;
+                if (!w) return false;
+                w.confirm = () => true;
+                w.alert   = () => {};
+                w.prompt  = () => '';
+                return true;
+            } catch (_) { return false; }   // cross-origin guard
+        },
+        /** Polls predicate (sync or async) until truthy. v1.7: error text "waitFor timeout: <label>". */
+        async waitFor(predicate, { timeoutMs = 30000, intervalMs = 200, label = '' } = {}) {
             const start = Date.now();
-            while (Date.now() - start < timeoutMs) {
+            for (;;) {
                 try {
                     const v = await predicate();
                     if (v) return v;
-                } catch (_) {}
+                } catch (_) { /* not ready yet */ }
+                if (Date.now() - start > timeoutMs) throw new Error(`waitFor timeout${label ? ': ' + label : ''}`);
                 await sleep(intervalMs);
             }
-            throw new Error(`waitFor(${label}) timed out`);
         },
-        async simulateDrag(iframeEl, fromEl, toEl, { steps = 12, holdMs = 50 } = {}) {
-            if (!iframeEl || !iframeEl.contentDocument) throw new Error('iframe has no contentDocument');
-            const doc = iframeEl.contentDocument;
-            const win = iframeEl.contentWindow;
+        /**
+         * v1.7 — Simulated pointer drag between two elements of an iframe
+         * (version proven on the Shadow army battle UI, taken from Veyra).
+         * Scrolls both endpoints into view, dispatches pointerdown on fromEl,
+         * `steps` pointermove on fromEl AND document, then pointerup on toEl
+         * AND document (buttons:0).
+         */
+        async simulateDrag(iframeEl, fromEl, toEl, { steps = 16, stepMs = 25, holdMs = 50, scrollIntoView = true, onCoords = null } = {}) {
+            const win = iframeEl && iframeEl.contentWindow;
+            const doc = iframeEl && iframeEl.contentDocument;
+            if (!win || !doc) throw new Error('iframe content not accessible');
+            const PE = win.PointerEvent || PointerEvent;
+
+            if (scrollIntoView) {
+                try { fromEl.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+                try { toEl.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+                await sleep(200);
+            }
+
             const fromRect = fromEl.getBoundingClientRect();
             const toRect   = toEl.getBoundingClientRect();
-            const sx = fromRect.left + fromRect.width  / 2;
-            const sy = fromRect.top  + fromRect.height / 2;
-            const ex = toRect.left   + toRect.width    / 2;
-            const ey = toRect.top    + toRect.height   / 2;
-
-            const evt = (type, x, y, target) => {
-                const e = new win.PointerEvent(type, {
-                    bubbles: true, cancelable: true, composed: true,
-                    pointerType: 'mouse', clientX: x, clientY: y, button: 0, buttons: 1,
-                });
-                target.dispatchEvent(e);
-            };
-            evt('pointerdown', sx, sy, fromEl);
-            for (let s = 1; s <= steps; s++) {
-                const t = s / steps;
-                const x = sx + (ex - sx) * t;
-                const y = sy + (ey - sy) * t;
-                evt('pointermove', x, y, doc.elementFromPoint(x, y) || toEl);
-                await sleep(holdMs);
+            const fromX = fromRect.left + fromRect.width  / 2;
+            const fromY = fromRect.top  + fromRect.height / 2;
+            const toX   = toRect.left   + toRect.width    / 2;
+            const toY   = toRect.top    + toRect.height   / 2;
+            if (typeof onCoords === 'function') {
+                try { onCoords({ fromX, fromY, toX, toY, viewportW: win.innerWidth, viewportH: win.innerHeight }); } catch (_) {}
             }
-            evt('pointerup', ex, ey, toEl);
+
+            const mk = (type, x, y) => new PE(type, {
+                bubbles: true, cancelable: true,
+                pointerType: 'mouse', isPrimary: true, pointerId: 1,
+                clientX: x, clientY: y, screenX: x, screenY: y,
+                button: 0, buttons: type === 'pointerup' ? 0 : 1,
+                view: win
+            });
+
+            fromEl.dispatchEvent(mk('pointerdown', fromX, fromY));
+            await sleep(holdMs);
+            for (let i = 1; i <= steps; i++) {
+                const t = i / steps;
+                const x = fromX + (toX - fromX) * t;
+                const y = fromY + (toY - fromY) * t;
+                fromEl.dispatchEvent(mk('pointermove', x, y));
+                doc.dispatchEvent(mk('pointermove', x, y));
+                await sleep(stepMs);
+            }
+            toEl.dispatchEvent(mk('pointerup', toX, toY));
+            doc.dispatchEvent(mk('pointerup', toX, toY));
         }
     };
 
@@ -1369,6 +1676,21 @@ const DSLib = (() => {
         }
     }
     /** Fetch current mana from a battle page. Auto-picks a monster id if none provided. */
+    /**
+     * v1.7 — battle target: a wave monster id (number/string) or a guild
+     * dungeon monster { instanceId, dgmid }. Returns the battle.php query
+     * string and the damage.php body params identifying the target.
+     */
+    function battleTarget(target) {
+        if (target && typeof target === 'object' && target.dgmid) {
+            return {
+                query:  `dgmid=${encodeURIComponent(target.dgmid)}&instance_id=${encodeURIComponent(target.instanceId)}`,
+                params: { instance_id: target.instanceId, dgmid: target.dgmid },
+            };
+        }
+        return { query: `id=${encodeURIComponent(target)}`, params: { monster_id: target } };
+    }
+
     async function fetchManaFromBattle(monsterId, { logFn = console.log } = {}) {
         if (!monsterId) {
             const anyCard = document.querySelector('.monster-container .monster-card');
@@ -1386,7 +1708,7 @@ const DSLib = (() => {
         }
         if (!monsterId) return null;
         try {
-            const response = await fetch(`${BATTLE_URL}?id=${encodeURIComponent(monsterId)}`, { credentials: 'same-origin' });
+            const response = await fetch(`${BATTLE_URL}?${battleTarget(monsterId).query}`, { credentials: 'same-origin' });
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             return extractManaFromDoc(new DOMParser().parseFromString(await response.text(), 'text/html'));
         } catch (err) {
@@ -1401,7 +1723,8 @@ const DSLib = (() => {
             return { simulated: true };
         }
         const stamCost = classSkill.stamCost ?? 1;
-        const body = `monster_id=${encodeURIComponent(monsterId)}&skill_id=${classSkill.id}&stamina_cost=${stamCost}`;
+        // v1.7 — monsterId may also be a dungeon target { instanceId, dgmid }
+        const body = buildFormBody({ ...battleTarget(monsterId).params, skill_id: classSkill.id, stamina_cost: stamCost });
         try {
             const response = await fetch(DAMAGE_URL, {
                 method: 'POST',
@@ -1412,7 +1735,7 @@ const DSLib = (() => {
             if (!response.ok && response.status !== 400) throw new Error(`HTTP ${response.status}`);
             return await response.json().catch(() => null);
         } catch (err) {
-            logFn(`⚠️ [CLASS] Cast ${classSkill.name} failed on ${monsterId} (${err.message || err})`);
+            logFn(`⚠️ [CLASS] Cast ${classSkill.name} failed on ${typeof monsterId === 'object' ? JSON.stringify(monsterId) : monsterId} (${err.message || err})`);
             console.error('Class skill cast failed:', err);
             return null;
         }
@@ -1462,8 +1785,7 @@ const DSLib = (() => {
     } = {}) {
         let _current = 0;
         let _refillsUsed = 0;
-        let _potionSDepleted = false;
-        let _potionLDepleted = false;
+        const _depleted = { S: false, L: false, F: false };
 
         async function refresh(monsterId) {
             const m = await fetchManaFromBattle(monsterId, { logFn });
@@ -1486,44 +1808,41 @@ const DSLib = (() => {
                 logFn(`🛑 [MANA] Max mana refills reached (${_refillsUsed}/${maxR}).`);
                 return false;
             }
-            const sAllowed = !!sh.useManaPotionS && !_potionSDepleted && !!sh.manaPotionSId;
-            const lAllowed = !!sh.useManaPotionL && !_potionLDepleted && !!sh.manaPotionLId;
-            if (!sAllowed && !lAllowed) {
+            // v1.7 — Full Mana Potion (useManaPotionF + fullManaPotionId).
+            const POTS = {
+                S: { allowed: !!sh.useManaPotionS && !_depleted.S && !!sh.manaPotionSId,    id: sh.manaPotionSId,    label: 'Mana Potion S' },
+                L: { allowed: !!sh.useManaPotionL && !_depleted.L && !!sh.manaPotionLId,    id: sh.manaPotionLId,    label: 'Mana Potion L' },
+                F: { allowed: !!sh.useManaPotionF && !_depleted.F && !!sh.fullManaPotionId, id: sh.fullManaPotionId, label: 'Full Mana Potion' },
+            };
+            const allowed = Object.keys(POTS).filter(k => POTS[k].allowed);
+            if (!allowed.length) {
                 logFn('🛑 [MANA] No mana potions allowed or available.');
                 return false;
             }
 
             const opts = { enableCalls, logFn };
-            let success = false;
-
             const tryPot = async (kind) => {
-                if (kind === 'L') {
-                    const ok = await useItemByInvId(sh.manaPotionLId, 'Mana Potion L', opts);
-                    if (!ok) { logFn('⚠️ [MANA] Mana Potion L depleted.'); _potionLDepleted = true; }
-                    return ok;
-                } else {
-                    const ok = await useItemByInvId(sh.manaPotionSId, 'Mana Potion S', opts);
-                    if (!ok) { logFn('⚠️ [MANA] Mana Potion S depleted.'); _potionSDepleted = true; }
-                    return ok;
-                }
+                const ok = await useItemByInvId(POTS[kind].id, POTS[kind].label, opts);
+                if (!ok) { logFn(`⚠️ [MANA] ${POTS[kind].label} depleted.`); _depleted[kind] = true; }
+                return ok;
             };
 
-            if (sAllowed && lAllowed) {
-                if (_current === 0) {
-                    logFn('💠 [MANA] Consuming Mana Potion L (mana = 0)...');
-                    success = await tryPot('L');
-                    if (!success) { logFn('⚠️ [MANA] Falling back to S.'); success = await tryPot('S'); }
+            // Order: mana = 0 → biggest first (F, L, S); otherwise smallest
+            // first (S, L, F) to avoid wasting a big potion. Falls back down
+            // the list when a potion is depleted. (S/L only = historical rule:
+            // L when mana = 0, else S.)
+            const order = (_current === 0 ? ['F', 'L', 'S'] : ['S', 'L', 'F']).filter(k => allowed.includes(k));
+            let success = false;
+            for (let i = 0; i < order.length && !success; i++) {
+                const k = order[i];
+                if (i === 0) {
+                    logFn(allowed.length === 1
+                        ? `💠 [MANA] Consuming ${POTS[k].label} (only ${k} allowed)...`
+                        : `💠 [MANA] Consuming ${POTS[k].label} (${_current === 0 ? 'mana = 0' : 'mana ' + _current})...`);
                 } else {
-                    logFn(`💠 [MANA] Consuming Mana Potion S (mana ${_current})...`);
-                    success = await tryPot('S');
-                    if (!success) { logFn('⚠️ [MANA] Falling back to L.'); success = await tryPot('L'); }
+                    logFn(`⚠️ [MANA] Falling back to ${k}.`);
                 }
-            } else if (lAllowed) {
-                logFn('💠 [MANA] Consuming Mana Potion L (only L allowed)...');
-                success = await tryPot('L');
-            } else if (sAllowed) {
-                logFn('💠 [MANA] Consuming Mana Potion S (only S allowed)...');
-                success = await tryPot('S');
+                success = await tryPot(k);
             }
 
             if (success) {
@@ -1536,8 +1855,10 @@ const DSLib = (() => {
         async function castSeal(monsterId, seal) {
             const res = await castClassSkill(monsterId, seal, { enableCalls, logFn });
             if (res) {
+                // v1.7 — the cost is only subtracted for a successful cast
+                // (a rejected cast, e.g. "Not enough mana", costs nothing).
                 if (typeof res.mana === 'number') _current = res.mana;
-                else                              _current = Math.max(0, _current - (seal.manaCost || 0));
+                else if (res.status === 'success' || res.simulated) _current = Math.max(0, _current - (seal.manaCost || 0));
                 try { onUiUpdate(_current); } catch (_) {}
             }
             return res;
@@ -1548,15 +1869,324 @@ const DSLib = (() => {
             setCurrent:           (n) => { _current = Math.max(0, Number(n) || 0); try { onUiUpdate(_current); } catch (_) {} },
             getMax:               () => maxMana,
             getRefillsUsed:       () => _refillsUsed,
-            isPotionSDepleted:    () => _potionSDepleted,
-            isPotionLDepleted:    () => _potionLDepleted,
-            resetCounters:        () => { _refillsUsed = 0; _potionSDepleted = false; _potionLDepleted = false; },
+            isPotionSDepleted:    () => _depleted.S,
+            isPotionLDepleted:    () => _depleted.L,
+            isPotionFDepleted:    () => _depleted.F,   // v1.7
+            resetCounters:        () => { _refillsUsed = 0; _depleted.S = _depleted.L = _depleted.F = false; },
             refresh,
             process,
             castSeal,
         };
     }
     /* ==================================================================== */
+    /* ====================================================================
+       v1.7 — HELPERS EXTRACTED FROM VEYRA 1.137
+    ==================================================================== */
+
+    /**
+     * GET a page and parse it into a Document.
+     *   throwOnError=false → returns null on network error / non-2xx.
+     *   throwOnError=true  → throws Error('HTTP <status>') / the network error.
+     *   noStore=true       → fetch option cache:'no-store'.
+     *   withHtml=true      → returns { doc, html } instead of the Document.
+     */
+    async function fetchDoc(url, { throwOnError = false, noStore = false, withHtml = false } = {}) {
+        try {
+            const init = { credentials: 'same-origin' };
+            if (noStore) init.cache = 'no-store';
+            const r = await fetch(url, init);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const html = await r.text();
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            return withHtml ? { doc, html } : doc;
+        } catch (err) {
+            if (throwOnError) throw err;
+            return null;
+        }
+    }
+
+    /**
+     * Temporarily sets a cookie while asyncFn runs, then restores the
+     * previous value. If the cookie did not exist before, it is left set
+     * (historical behaviour of every hide_dead_monsters toggle).
+     */
+    async function withCookie(name, value, asyncFn) {
+        const original = getCookie(name);
+        setCookie(name, value);
+        try { return await asyncFn(); }
+        finally { if (original !== null) setCookie(name, original); }
+    }
+
+    /** Countdown text: "2h 5m" (no seconds once hours > 0), "5m 12s", "12s". Rounds up. */
+    function formatCountdown(ms) {
+        if (!(ms > 0)) ms = 0;
+        const totalSec = Math.ceil(ms / 1000);
+        const h = Math.floor(totalSec / 3600);
+        const m = Math.floor((totalSec % 3600) / 60);
+        const s = totalSec % 60;
+        if (h > 0) return `${h}h ${m}m`;
+        if (m > 0) return `${m}m ${s}s`;
+        return `${s}s`;
+    }
+
+    /**
+     * Reads a JSON snapshot of session counters.
+     * Returns { name: number|null } for each counter (toNonNeg, null if
+     * absent/invalid) and { name: object|null } for each `objects` entry
+     * (plain non-array object only). `aliases` = { name: legacyName } is
+     * read when `name` is null/undefined in the snapshot.
+     */
+    function loadCounters(key, names = [], { objects = [], aliases = {}, storage = sessionStorage } = {}) {
+        const out = {};
+        names.forEach(n => { out[n] = null; });
+        objects.forEach(n => { out[n] = null; });
+        try {
+            const raw = storage.getItem(key);
+            if (!raw) return out;
+            const saved = JSON.parse(raw);
+            if (!saved || typeof saved !== 'object') return out;
+            names.forEach(n => {
+                let v = saved[n];
+                if ((v === undefined || v === null) && aliases[n]) v = saved[aliases[n]];
+                out[n] = toNonNeg(v);
+            });
+            objects.forEach(n => {
+                const v = saved[n];
+                if (v && typeof v === 'object' && !Array.isArray(v)) out[n] = v;
+            });
+        } catch (err) {
+            console.error(`[DSLib] loadCounters(${key}) failed`, err);
+        }
+        return out;
+    }
+    function saveCounters(key, obj, { storage = sessionStorage } = {}) {
+        try { storage.setItem(key, JSON.stringify(obj)); }
+        catch (err) { console.error(`[DSLib] saveCounters(${key}) failed`, err); }
+    }
+
+    /** Tiny persistent JSON value: { load(), save(v), update(fn) }. Never throws. */
+    function createJsonStore(key, { storage = localStorage, fallback = {} } = {}) {
+        const clone = () => (fallback && typeof fallback === 'object') ? JSON.parse(JSON.stringify(fallback)) : fallback;
+        const load = () => {
+            try { const raw = storage.getItem(key); return raw ? JSON.parse(raw) : clone(); }
+            catch (_) { return clone(); }
+        };
+        const save = (v) => { try { storage.setItem(key, JSON.stringify(v)); } catch (_) {} };
+        return { load, save, update(fn) { const v = load(); const r = fn(v); save(r === undefined ? v : r); } };
+    }
+
+    /**
+     * Typed log console rendered into #elementId (newest first by default).
+     * Entries { ts, message, type } with type info|success|warn|error.
+     * Safe to use before the element exists (render no-ops).
+     */
+    const LOG_TYPE_COLORS = { error: '#ff6b6b', success: '#69db7c', warn: '#fcc419', info: '#cdd6f4' };
+    function createTypedLogBuffer({ elementId, max = 100, newestFirst = true, colors = LOG_TYPE_COLORS } = {}) {
+        const entries = [];
+        function render() {
+            const box = elementId ? document.getElementById(elementId) : null;
+            if (!box) return;
+            const list = newestFirst ? entries.slice().reverse() : entries;
+            box.innerHTML = list.map(l => {
+                const color = colors[l.type] || colors.info;
+                return `<div style="color:${color};font-size:11px;line-height:1.45"><span style="opacity:.55">${l.ts}</span> ${escapeHtml(l.message)}</div>`;
+            }).join('');
+        }
+        return {
+            add(message, type = 'info') {
+                entries.push({ ts: now(), message, type });
+                if (entries.length > max) entries.shift();
+                render();
+            },
+            clear() { entries.length = 0; render(); },
+            render,
+            entries: () => entries.slice(),
+        };
+    }
+
+    /**
+     * Chained setTimeout scheduler (cycle → wait interval → cycle …).
+     *   run({ isActive }) — the cycle; isActive() stays true while the
+     *                       scheduler runs or during a runNow().
+     *   onStart / onStop  — side effects (persist autoResume, logs…).
+     * Unlike createIntervalLoop, the next cycle is armed only after the
+     * previous one finished, getNextTickAt() is exposed, and a cycle is
+     * never run twice concurrently (scheduled + runNow).
+     */
+    function createHourlyScheduler({ getIntervalMs, run, onStart = null, onStop = null } = {}) {
+        if (typeof run !== 'function') throw new Error('[DSLib] createHourlyScheduler: run(fn) required');
+        let running = false, timerId = null, nextTickAt = 0, inFlight = false, manual = false;
+        const isActive = () => running || manual;
+
+        async function runCycle(isManual) {
+            if (inFlight) return false;
+            inFlight = true; manual = !!isManual;
+            try { await run({ isActive }); }
+            finally { inFlight = false; manual = false; }
+            return true;
+        }
+        function schedule(delayMs = getIntervalMs()) {
+            if (timerId) clearTimeout(timerId);
+            nextTickAt = Date.now() + delayMs;
+            timerId = setTimeout(async () => {
+                timerId = null;
+                if (!running) return;
+                try { await runCycle(false); }
+                catch (e) { console.error('[DSLib] createHourlyScheduler: cycle error', e); }
+                if (running) schedule();   // always re-armed, even after an error
+            }, delayMs);
+        }
+        function start(delayMs = 0) {
+            if (running) return;
+            running = true;
+            if (onStart) onStart();
+            schedule(delayMs);
+        }
+        function stop() {
+            if (!running && !timerId) return;
+            running = false;
+            if (timerId) { clearTimeout(timerId); timerId = null; }
+            nextTickAt = 0;
+            if (onStop) onStop();
+        }
+        return {
+            start, stop,
+            toggle() { if (running) stop(); else start(); return running; },
+            reschedule() { if (running) schedule(); },
+            runNow: () => runCycle(true),
+            isRunning: () => running,
+            isActive,
+            isInFlight: () => inFlight,
+            getNextTickAt: () => nextTickAt,
+        };
+    }
+
+    /**
+     * Drag & drop ordered list with an "Enabled" checkbox per row
+     * (DOM/classes of Veyra's Wave Scan Order: .ds-wave-order-*).
+     *   items       — array or () => array of { key, label, enabled }
+     *   onToggle    — (key, checked)
+     *   onReorder   — (draggedKey, targetKey); the list re-renders after it.
+     */
+    function renderOrderList(container, opts) {
+        const { items, onToggle, onReorder, chkClass = 'ds-order-enable-chk',
+                toggleTitle = 'Enable', toggleLabel = 'Enabled', dataAttr = 'orderKey' } = opts || {};
+        if (!container) return;
+        container.innerHTML = '';
+        const list = (typeof items === 'function' ? items() : items) || [];
+        const clearOver = (except) => container.querySelectorAll('.ds-wave-order-item').forEach(c => { if (c !== except) c.classList.remove('drag-over'); });
+        list.forEach((it, idx) => {
+            const key = it.key;
+            const card = document.createElement('div');
+            card.className = 'ds-wave-order-item';
+            card.draggable = true;
+            card.dataset[dataAttr] = key;
+            card.innerHTML = `
+                <span class="ds-wave-order-handle" title="Drag to reorder">☰</span>
+                <span class="ds-wave-order-pos">#${idx + 1}</span>
+                <span class="ds-wave-order-label">${it.label}</span>
+                <label class="ds-wave-order-toggle" title="${escapeAttr(toggleTitle)}">
+                    <input type="checkbox" class="${chkClass}" ${it.enabled ? 'checked' : ''}>
+                    <span>${toggleLabel}</span>
+                </label>
+            `;
+            const chk = card.querySelector('input[type="checkbox"]');
+            chk.addEventListener('change', () => { if (onToggle) onToggle(key, chk.checked); });
+            card.addEventListener('dragstart', (e) => {
+                card.classList.add('dragging');
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', key);
+            });
+            card.addEventListener('dragend', () => { card.classList.remove('dragging'); clearOver(null); });
+            card.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                clearOver(card);
+                if (!card.classList.contains('dragging')) card.classList.add('drag-over');
+            });
+            card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+            card.addEventListener('drop', (e) => {
+                e.preventDefault();
+                const dragged = e.dataTransfer.getData('text/plain');
+                if (!dragged || dragged === key) return;
+                if (onReorder) onReorder(dragged, key);
+                renderOrderList(container, opts);
+            });
+            container.appendChild(card);
+        });
+    }
+
+    /**
+     * Makes a fixed-position panel/modal draggable by a handle, with
+     * position persisted in localStorage[storageKey].
+     *   handle      — element, or null to pick the first of `handleCandidates`
+     *                 (selectors / elements) found, else the element itself.
+     *   clamp       — 'size' : keep the whole element on screen while dragging
+     *                 {x,y}  : keep at least x/y px of it visible (default 100/50)
+     *   cursor      — set cursor:move + user-select:none on the handle.
+     *   clearTransform — drop a centering transform when positioned.
+     */
+    function makeElementDraggable(el, {
+        handle = null, handleCandidates = [], storageKey = null,
+        clamp = { x: 100, y: 50 }, cursor = true, clearTransform = true,
+        ignoreSelector = 'input,button,select,textarea,a,label,[contenteditable]',
+    } = {}) {
+        if (!el || el.__dsDragBound) return;
+        el.__dsDragBound = true;
+        const anchor = () => {
+            if (clearTransform) el.style.transform = 'none';
+            el.style.right  = 'auto';
+            el.style.bottom = 'auto';
+        };
+        if (storageKey) {
+            try {
+                const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
+                if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
+                    el.style.left = Math.min(saved.left, window.innerWidth  - 100) + 'px';
+                    el.style.top  = Math.min(saved.top,  window.innerHeight - 50)  + 'px';
+                    anchor();
+                }
+            } catch (_) {}
+        }
+        let h = handle;
+        if (!h) {
+            for (const c of handleCandidates) {
+                const found = typeof c === 'string' ? el.querySelector(c) : c;
+                if (found) { h = found; break; }
+            }
+        }
+        h = h || el;
+        if (cursor) { try { h.style.cursor = 'move'; h.style.userSelect = 'none'; } catch (_) {} }
+        let drag = null;
+        h.addEventListener('mousedown', (e) => {
+            if (ignoreSelector && e.target.closest(ignoreSelector)) return;
+            e.preventDefault();
+            const rect = el.getBoundingClientRect();
+            anchor();
+            el.style.left = rect.left + 'px';
+            el.style.top  = rect.top  + 'px';
+            drag = { dx: e.clientX - rect.left, dy: e.clientY - rect.top };
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!drag) return;
+            const mx = clamp === 'size' ? el.offsetWidth  : (clamp.x ?? 100);
+            const my = clamp === 'size' ? el.offsetHeight : (clamp.y ?? 50);
+            const maxX = Math.max(0, window.innerWidth  - mx);
+            const maxY = Math.max(0, window.innerHeight - my);
+            el.style.left = Math.max(0, Math.min(maxX, e.clientX - drag.dx)) + 'px';
+            el.style.top  = Math.max(0, Math.min(maxY, e.clientY - drag.dy)) + 'px';
+        });
+        document.addEventListener('mouseup', () => {
+            if (!drag) return;
+            drag = null;
+            const left = parseInt(el.style.left, 10);
+            const top  = parseInt(el.style.top,  10);
+            if (storageKey && Number.isFinite(left) && Number.isFinite(top)) {
+                try { localStorage.setItem(storageKey, JSON.stringify({ left, top })); } catch (_) {}
+            }
+        });
+    }
+
     /* ====================================================================
        v1.5 — KILL SWITCH (Niveau 3 : manifest distant bloquant)
        Permet de désactiver à distance des versions de DSLib publiées,
@@ -1646,5 +2276,12 @@ const DSLib = (() => {
         getStackCount,
         sumStackCounts,
         pickCardsForCount,
+        // v1.7 — Veyra 1.137 refactor helpers
+        fetchInventoryPage, invalidateInventoryCache,
+        fetchDoc, withCookie, formatCountdown,
+        loadCounters, saveCounters, createJsonStore,
+        createTypedLogBuffer, LOG_TYPE_COLORS,
+        createHourlyScheduler, renderOrderList, makeElementDraggable,
+        runHitLoop, HIT_LOOP_MSGS,
     };
 })();
